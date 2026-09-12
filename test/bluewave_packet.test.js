@@ -49,6 +49,9 @@ const Fti = {
     MsgPtr: 170,
     MsgLength: 174,
     Flags: 178,
+    OrigZone: 180,
+    OrigNet: 182,
+    OrigNode: 184,
 };
 
 //  a field is a NUL terminated CP437 string in a fixed slot
@@ -62,6 +65,9 @@ function makeMessage(areaTag, overrides = {}) {
     return Object.assign(
         {
             areaTag,
+            //  what a reply comes back naming, so it has to be the message's
+            //  own ID rather than a number local to the packet
+            messageId: 1,
             fromUserName: 'Sender',
             toUserName: 'Recipient',
             subject: 'A subject',
@@ -169,15 +175,18 @@ describe('Blue Wave packet', () => {
         );
     });
 
-    //  nothing here processes an uploaded reply packet yet
-    it('does not claim it can read .UPL replies', done => {
+    //
+    //  A reader writes a *.UPL only when the host says it can process one,
+    //  so a zero here means every reply the caller writes is thrown away.
+    //
+    it('says it can read .UPL replies', done => {
         buildPacket(
             writer => {
                 writer.addArea('general');
                 writer.appendMessage(makeMessage('general'));
             },
             ({ inf }) => {
-                assert.equal(inf.readUInt8(Inf.UsesUplFile), 0);
+                assert.notEqual(inf.readUInt8(Inf.UsesUplFile), 0);
                 done();
             }
         );
@@ -261,6 +270,7 @@ describe('Blue Wave packet', () => {
             writer => {
                 writer.appendMessage(
                     makeMessage('general', {
+                        messageId: 4242,
                         fromUserName: 'Alice',
                         toUserName: 'Bob',
                         subject: 'Hello there',
@@ -273,9 +283,62 @@ describe('Blue Wave packet', () => {
                 assert.equal(str(fti, Fti.Subject, 72), 'Hello there');
                 assert.equal(str(fti, Fti.Date, 20), '09 Sep 26  12:34:56');
                 assert.equal(str(fti, Fti.Date, 20).length, 19);
-                assert.equal(fti.readUInt16LE(Fti.MsgNum), 1);
+                assert.equal(fti.readUInt16LE(Fti.MsgNum), 4242);
                 assert.equal(fti.readUInt16LE(Fti.ReplyTo), 0);
                 assert.equal(fti.readUInt16LE(Fti.ReplyAt), 0);
+                done();
+            }
+        );
+    });
+
+    //
+    //  A reply names the message it answers by this number, so the number has
+    //  to be one the board can resolve on the way back in.
+    //
+    it('numbers each message with its own message ID', done => {
+        buildPacket(
+            writer => {
+                writer.addArea('general');
+                writer.appendMessage(makeMessage('general', { messageId: 900 }));
+                writer.appendMessage(makeMessage('general', { messageId: 901 }));
+            },
+            ({ fti }) => {
+                assert.equal(fti.readUInt16LE(Fti.MsgNum), 900);
+                assert.equal(fti.slice(RecordLength.Fti).readUInt16LE(Fti.MsgNum), 901);
+                done();
+            }
+        );
+    });
+
+    //
+    //  The field is 16 bits and a message ID is not. Truncating one would
+    //  name a different message, and an import would thread a reply onto it.
+    //
+    it('writes zero rather than truncating a message ID past 65535', done => {
+        buildPacket(
+            writer => {
+                writer.addArea('general');
+                writer.appendMessage(makeMessage('general', { messageId: 70000 }));
+            },
+            ({ fti }) => {
+                assert.equal(fti.readUInt16LE(Fti.MsgNum), 0);
+                done();
+            }
+        );
+    });
+
+    it('warns once when a message ID will not fit', done => {
+        const warnings = [];
+        buildPacket(
+            writer => {
+                writer.on('warning', w => warnings.push(w));
+                writer.addArea('general');
+                writer.appendMessage(makeMessage('general', { messageId: 70000 }));
+                writer.appendMessage(makeMessage('general', { messageId: 80000 }));
+            },
+            () => {
+                assert.equal(warnings.length, 1);
+                assert.match(warnings[0].message, /65535/);
                 done();
             }
         );
@@ -595,6 +658,94 @@ describe('Blue Wave area kinds', () => {
         );
     });
 
+    //
+    //  A reader addresses a netmail reply from these rather than asking the
+    //  caller to retype an address they were just reading.
+    //
+    it('carries the origin address of a netmail message', done => {
+        withAreas(
+            writer => {
+                writer.addArea('fido_general');
+                writer.appendMessage(
+                    makeMessage('fido_general', {
+                        getRemoteFromUser: () => '1:234/56.7',
+                    })
+                );
+            },
+            ({ fti }) => {
+                assert.equal(fti.readUInt16LE(Fti.OrigZone), 1);
+                assert.equal(fti.readUInt16LE(Fti.OrigNet), 234);
+                assert.equal(fti.readUInt16LE(Fti.OrigNode), 56);
+                done();
+            }
+        );
+    });
+
+    //  the kit: zero unless the message came from a netmail base
+    it('leaves the origin address zero for a local message', done => {
+        withAreas(
+            writer => {
+                writer.addArea('chatter');
+                writer.appendMessage(makeMessage('chatter'));
+            },
+            ({ fti }) => {
+                assert.equal(fti.readUInt16LE(Fti.OrigZone), 0);
+                assert.equal(fti.readUInt16LE(Fti.OrigNet), 0);
+                assert.equal(fti.readUInt16LE(Fti.OrigNode), 0);
+                done();
+            }
+        );
+    });
+
+    //
+    //  MultiMail lifts these out of the body of a message in an Internet
+    //  area and uses them to address and thread a reply. In a FidoNet area it
+    //  would leave them in the text for the caller to read.
+    //
+    it('writes the Internet kludges into an Internet area message', done => {
+        withAreas(
+            writer => {
+                writer.addArea('a_newsgroup');
+                writer.appendMessage(
+                    makeMessage('a_newsgroup', {
+                        getRemoteFromUser: () => 'someone@example.com',
+                        meta: {
+                            FtnKludge: {
+                                MSGID: '<abc@example.com>',
+                                REPLY: '<xyz@example.com>',
+                            },
+                        },
+                    })
+                );
+            },
+            ({ dat }) => {
+                const text = iconv.decode(dat, 'cp437');
+                assert.match(text, /\u0001From: someone@example\.com/);
+                assert.match(text, /\u0001Message-ID: <abc@example\.com>/);
+                assert.match(text, /\u0001References: <xyz@example\.com>/);
+                done();
+            }
+        );
+    });
+
+    it('leaves them out of a FidoNet area message', done => {
+        withAreas(
+            writer => {
+                writer.addArea('fido_general');
+                writer.appendMessage(
+                    makeMessage('fido_general', {
+                        getRemoteFromUser: () => '1:234/56',
+                        meta: { FtnKludge: { MSGID: '1:234/56 abcd1234' } },
+                    })
+                );
+            },
+            ({ dat }) => {
+                assert.equal(iconv.decode(dat, 'cp437').includes('\u0001'), false);
+                done();
+            }
+        );
+    });
+
     //  the caller's own mail, which the chart calls NetMail; nothing public
     //  can be posted into it
     it('calls private mail netmail', done => {
@@ -675,12 +826,14 @@ describe('Blue Wave packet fixture', () => {
 
             writer.appendMessage(
                 makeMessage('general', {
+                    messageId: 101,
                     subject: 'A fixture message',
                     message: 'One line of text.',
                 })
             );
             writer.appendMessage(
                 makeMessage('fido_general', {
+                    messageId: 102,
                     fromUserName: 'Distant Node',
                     subject: 'An echomail fixture',
                     message: 'Another line.',
